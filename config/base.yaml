@@ -1,0 +1,25 @@
+# Parametros del proyecto. Lo que lean los scripts sale de aqui, no del codigo.
+
+datos:
+  raw_dir: data/raw/omie          # ficheros marginalpdbc_AAAAMMDD.1 tal cual los da OMIE
+  processed_dir: data/processed   # precios_omie.parquet
+  desde: 2021-01-01
+  hasta: null                     # null = hasta ayer
+
+bateria:
+  # 2 h, como las baterias que se estan conectando en España.
+  duracion_horas: 2
+  # Ida y vuelta (carga + descarga), en AC. 0.85 es un valor tipico de LFP con
+  # auxiliares; SUPUESTO, sustituir por el dato del fabricante si lo hay.
+  eficiencia_ida_vuelta: 0.85
+  # Garantias habituales: ~1 ciclo/dia. SUPUESTO.
+  ciclos_maximos_anuales: 365
+
+simulacion:
+  # Parque de baterias añadido a las curvas de OMIE (scripts/05_simula_baterias.py).
+  dia: 2025-05-15                 # dia de referencia: hace falta su curva_pbc
+  # GW instalados en España; 17 GW = objetivo de almacenamiento del PNIEC a 2030.
+  escenarios_gw: [0, 2, 5, 10, 17]
+  # Tamaño de cada tramo del parque (ver pce68.dispatch.flota). Mas pequeño = baterias
+  # que compiten mejor; 0 = todo el parque en las mismas horas.
+  paso_mw: 250
