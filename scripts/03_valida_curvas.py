@@ -3,8 +3,9 @@
     uv run python scripts/03_valida_curvas.py --dia 2025-05-15
 
 Para cada periodo del dia compara el precio donde se cruzan la oferta y la demanda con
-el precio de data/raw/omie/marginalpdbc_AAAAMMDD.1. Se hace con y sin los escalones de
-ofertas complejas. En los periodos en que España y Portugal casaron a precios distintos
+el precio de data/raw/omie/marginalpdbc_AAAAMMDD.1. Se hace con las tres formas de tratar
+las ofertas complejas de pce68.data.curvas.precios: su volumen casado (por defecto), todo
+lo ofertado, o sin ellas. En los periodos en que España y Portugal casaron a precios distintos
 se usa la curva ES (ver pce68.data.curvas); el resumen se da para todo el dia y para los
 periodos sin separacion.
 """
@@ -45,11 +46,12 @@ def main() -> None:
     publicado = publicado[["timestamp_utc", "precio_es", "precio_pt"]]
 
     curvas = cargar_curvas(dia)
-    con = precios(curvas, complejas=True).rename(columns={"precio_eur_mwh": "cruce"})
-    sin = precios(curvas).rename(columns={"precio_eur_mwh": "cruce_sin_complejas"})
-    t = publicado.merge(con, on="timestamp_utc").merge(sin, on="timestamp_utc")
-    t["dif"] = t["cruce"] - t["precio_es"]
-    t["dif_sin_complejas"] = t["cruce_sin_complejas"] - t["precio_es"]
+    t = publicado
+    modos = (("casadas", "cruce"), ("ofertadas", "cruce_ofertadas"), ("no", "cruce_sin_complejas"))
+    for modo, col in modos:
+        cruce = precios(curvas, complejas=modo).rename(columns={"precio_eur_mwh": col})
+        t = t.merge(cruce, on="timestamp_utc")
+        t[col.replace("cruce", "dif")] = t[col] - t["precio_es"]
     t["iberico"] = t["precio_es"] == t["precio_pt"]
     t.insert(0, "hora", t["timestamp_utc"].dt.tz_convert(omie.TZ).dt.strftime("%H:%M"))
 
@@ -59,7 +61,7 @@ def main() -> None:
     print(f"\n{dia}: {len(t)} periodos, {t['iberico'].sum()} sin separacion Espana-Portugal")
     grupos = (("todos", t), ("sin separacion", t[t["iberico"]]), ("con separacion", t[~t["iberico"]]))
     for grupo, sub in grupos:
-        for nombre in ("dif", "dif_sin_complejas"):
+        for nombre in ("dif", "dif_ofertadas", "dif_sin_complejas"):
             d = sub[nombre].abs()
             if len(d):
                 print(f"  {grupo:15s} {nombre:18s} mediana |dif| = {d.median():.3f} €/MWh, "

@@ -31,17 +31,21 @@ Limites à garder en tête : prix aceptante dans `battery.py` (plafond de revenu
 config/base.yaml                 paramètres : dates de téléchargement, batterie (durée, rendement, cycles)
 src/pce68/data/omie.py           téléchargement et lecture de marginalpdbc (prix horaires puis quart d'heure)
 src/pce68/data/curvas.py         lecture des courbes curva_pbc et prix à l'intersection offre/demande
+src/pce68/data/esios.py          fondamentaux ESIOS (demande, production par filière), token dans .env ou ESIOS_TOKEN
 src/pce68/features/regimenes.py  régimes : pre_crisis, crisis_gas, excepcion_iberica, normalizacion
 src/pce68/features/metrics.py    spread quotidien (N heures les plus chères moins N les moins chères)
 src/pce68/dispatch/battery.py    arbitrage d'une batterie de 1 MW, un cycle par jour, prix aceptante
 src/pce68/excel.py               mise en forme des tableaux Excel (utilisée par 04 et 05)
 src/pce68/dispatch/flota.py      parc de batteries ajouté aux courbes OMIE (charge = demande, décharge = offre)
+src/pce68/dispatch/lp.py         parc planifié par LP sur toute la période (état de charge continu, budget de cycles)
 scripts/01_descarga_omie.py      télécharge les prix OMIE -> data/processed/precios_omie.parquet
 scripts/02_descarga_curvas.py    télécharge les courbes, les réduit en parquet (data/processed/curvas/)
 scripts/03_valida_curvas.py      compare l'intersection des courbes au prix publié par OMIE
 scripts/04_exporta_excel.py      génère reports/analisis_exploratorio.xlsx (SORTIE, jamais éditée à la main)
 scripts/05_simula_baterias.py    simulation avant/après -> reports/simulacion/ (CSV, PNG, xlsx : SORTIES)
-tests/                           pytest (test_pce68.py, test_curvas.py, test_flota.py)
+scripts/06_simula_lp.py          simulation LP sur plusieurs jours -> reports/simulacion_lp/ (CSV, PNG : SORTIES)
+scripts/07_descarga_fundamentales.py  ESIOS -> data/processed/fundamentales.parquet (indicateurs dans config/base.yaml)
+tests/                           pytest (test_pce68.py, test_curvas.py, test_flota.py, test_lp.py, test_esios.py)
 ```
 
 Les dossiers `src/data`, `src/dispatch`, `src/features` (hors `src/pce68`) sont d'anciennes copies : **le code utilisé est dans `src/pce68`**. Ne les modifie pas ; propose de les supprimer.
@@ -57,6 +61,11 @@ uv run python scripts/03_valida_curvas.py --dia 2025-05-15
 uv run python scripts/04_exporta_excel.py [--demo]
 uv run python scripts/05_simula_baterias.py [--dia 2025-05-15 --gw 0 2 5 10 17 --paso-mw 250]   # ~8 min
 uv run python scripts/05_simula_baterias.py --desde-csv   # refait Excel et PNG depuis les CSV, sans resimuler
+uv run python scripts/02_descarga_curvas.py --desde 2026-09-01 --hasta 2026-09-14 --cada 1
+uv run python scripts/06_simula_lp.py            # paramètres : config/base.yaml, section simulacion_lp (~2 min)
+uv run python scripts/06_simula_lp.py --desde-csv   # refait l'Excel et les PNG depuis les CSV, sans resimuler
+open reports/simulacion_lp/simulacion_lp_20260901_20260914.xlsx
+uv run python scripts/07_descarga_fundamentales.py [--buscar "eolica"]   # token ESIOS lu dans .env (ou ESIOS_TOKEN)
 open reports/analisis_exploratorio.xlsx
 ```
 
@@ -67,17 +76,28 @@ Conventions : code et commentaires en espagnol dans les modules existants (les n
 - Téléchargement : `https://www.omie.es/es/file-download?parents=curva_pbc&filename=curva_pbc_AAAAMMDD.1` ; un fichier par jour, environ 4 Mo en horaire (avant le 01/10/2025) et 18 à 20 Mo en quart d'heure. L'archive publique couvre les 6 dernières années.
 - CSV en `;`, encodage latin-1, 3 lignes d'en-tête, nombres à l'espagnole (`1.991,1`).
 - Colonnes : période ; date ; pays (`MI`, `ES`, `PT`) ; unité (vide) ; type (`V` vente, `C` achat) ; MW ; €/MWh ; `O` offerte / `C` casée ; typologie.
+- **Période** : un nombre (`1`…`24`) en horaire ; en quart d'heure, une étiquette **`HxQy`** (`H1Q1`…`H24Q4`, `H25Qy` les jours de 25 h), soit la période (x − 1) × 4 + y. Vérifié sur `curva_pbc_20260913.1` ; `curvas.py` gère les deux depuis le 10/11/2026.
 - Typologie : `S` offre simple ; `C01`, `C02`, `C04` offres complexes ; `Imp XX` / `Exp XX` flux d'interconnexion casés. Leurs MW sont réels (souvent 1000 MW = capacité saturée) : avec eux l'intersection retombe sur le prix publié, et la méthode « solde des volumes casés » donne le même résultat (vérifié le 15/05/2025).
 - Les lignes `C` répètent une partie des lignes `O` : la courbe se construit avec les `O`.
 - **Quand l'Espagne et le Portugal ont le même prix, le fichier ne contient que `MI`. Quand les prix divergent (typiquement 9h à 19h au printemps), il contient des lignes séparées `ES` et `PT`** (vérifié sur la période 12 du 15/05/2025).
 
-## État de la validation (15/05/2025)
+## État de la validation
 
-`curvas.py` utilise la courbe `ES` si elle existe, sinon `MI` (jamais `PT`), et ignore par défaut les offres complexes (`complejas=False`). Résultat sur les 24 heures : intersection exacte à 17 heures, écart maximal 0,98 €/MWh (les 11 heures avec séparation sont toutes exactes). Avec les offres complexes, l'écart monte à 31 €/MWh.
+`curvas.py` utilise la courbe `ES` si elle existe, sinon `MI` (jamais `PT`). Par défaut (`complejas="casadas"`, depuis le 10/11/2026), les offres simples entrent pour tout le volume offert et les offres complexes **seulement pour leur volume casé** (lignes `C` de typologie `C0x`, gardées dans la colonne `casada`). Écart au prix publié (maximum ; périodes à moins de 0,01 €/MWh) :
+
+| Jour | `casadas` (défaut) | `no` (ancien défaut) | `ofertadas` |
+|---|---|---|---|
+| 15/05/2025 (horaire) | 0,98 ; 17/24 | 0,98 ; 17/24 | 31,5 ; 5/24 |
+| 02/09/2026 (quart d'heure) | 1,23 ; 82/96 | 103,3 ; 0/96 | 51,4 ; 1/96 |
+| 13/09/2026 (quart d'heure) | 1,38 ; 84/96 | 15,4 ; 45/96 | 44,9 ; 9/96 |
+
+En quart d'heure, ignorer les offres complexes n'est plus acceptable (jusqu'à 103 €/MWh d'écart).
 
 ## À faire en priorité
 
-Faits : correction ES/MI de `curvas.py`, offres complexes exclues par défaut, flux d'interconnexion vérifiés, première simulation (`05_simula_baterias.py`, un seul jour : 15/05/2025).
+Faits : correction ES/MI de `curvas.py`, offres complexes au volume casé, format `HxQy` du quart d'heure, flux d'interconnexion vérifiés, première simulation (`05_simula_baterias.py`, un seul jour : 15/05/2025), fondamentaux ESIOS du 1er au 14/09/2026.
+
+En cours : simulation LP d'un parc de 5 GW sur le 1er-14/09/2026 (voir `docs/modelo_lp_sept2026.html`).
 
 1. Revalider `curvas.py` sur plusieurs jours (printemps, été, hiver, avant et après le 01/10/2025, donc aussi en quart d'heure).
 2. Télécharger les courbes (`02_descarga_curvas.py --cada 10`) et lancer la simulation sur ces jours ; agréger les revenus par saison et par année.
@@ -86,6 +106,7 @@ Faits : correction ES/MI de `curvas.py`, offres complexes exclues par défaut, f
 
 ## Pièges connus (Mac)
 
+- **Le dossier du projet est dans `Documents`, synchronisé par iCloud** : macOS peut « alléger » des fichiers (drapeau `dataless`, visible avec `ls -lO`), d'où des `TimeoutError: [Errno 60]` ou « Need authenticator » à la lecture. Le venv est donc hors du projet : `export UV_PROJECT_ENVIRONMENT="$HOME/.venvs/pce68"` (à mettre dans `~/.zshrc`), puis `uv sync --all-groups`. Le `.venv` du projet ne sert plus.
 - `ModuleNotFoundError: No module named 'pce68'` : sur le Mac de Tim, `.venv/lib/python3.13/site-packages/_editable_impl_pce68.pth` et le dossier `pce68-0.1.0.dist-info` portent le flag macOS `hidden`, que Python 3.13 semble ignorer. Correctif : `chflags -R nohidden .venv`. Contournement : `PYTHONPATH=src uv run ...`. Si le problème revient après un `uv sync`, relancer le correctif.
 - `uv run pytest` peut lancer un `pytest` hors du `.venv` : utiliser `uv run python -m pytest`, après `uv sync --all-groups`.
 - `.vscode/settings.json` contient `"python-envs.defaultEnvManager": "ms-python.python:system"` : dans VS Code, choisir l'interpréteur `.venv/bin/python` (Cmd + Maj + P, « Python: Select Interpreter »).
@@ -94,6 +115,7 @@ Faits : correction ES/MI de `curvas.py`, offres complexes exclues par défaut, f
 ## Règles de travail
 
 - Le dépôt GitHub (timothierry-oss/PCE-Engie) est **public** : n'y mets ni données confidentielles ENGIE, ni documents du client, ni coordonnées de personnes. Les dossiers `data/` et `docs/` sont ignorés par git (`.gitignore`) ; garde-les ainsi.
+- Le token ESIOS est dans `.env` (racine du projet, ignoré par git) : il peut y rester, mais **ne le commite jamais** (avant un commit, vérifier avec `git status` que `.env` n'y figure pas).
 - Les documents de référence (slides du client, PDF sur la crise du 28/04/2025, courbe en canard, etc.) peuvent être placés dans `docs/` pour lecture, sans les commiter.
 - Avant de modifier un fichier, dis ce que tu vas changer. N'écrase pas `reports/*.xlsx` à la main : ils sont régénérés par le script.
 - Pas de résultat inventé : si une donnée manque, demande-la ou indique que c'est une hypothèse.

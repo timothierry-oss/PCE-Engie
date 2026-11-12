@@ -1,6 +1,7 @@
 reports/*.xlsx
 /data/
 /docs/
+.env
 __pycache__/
 .venv/
 .pytest_cache/
@@ -8,3 +9,4 @@ __pycache__/
 
 .DS_Store
 **/.DS_Store
+~$*

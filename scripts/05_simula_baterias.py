@@ -135,7 +135,7 @@ def figura_curvas(curvas: pd.DataFrame, tabla: pd.DataFrame, gw: float, col, dia
     for ax, (que, i) in zip(axs, horas, strict=True):
         fila = tabla.loc[i]
         g = curvas[curvas["timestamp_utc"] == fila["timestamp_utc"]]
-        g = g[~g["tipologia"].str.fullmatch(r"C\d+")]  # como curvas.precios por defecto
+        g = g[~g["tipologia"].str.fullmatch(r"C\d+") | g["casada"]]  # como curvas.precios por defecto
         carga, descarga = max(fila[f"mw_{gw:g}gw"], 0.0), max(-fila[f"mw_{gw:g}gw"], 0.0)
         cortes = []
         for nombre, extra_d, extra_o, color, ls in (
@@ -163,7 +163,7 @@ def figura_curvas(curvas: pd.DataFrame, tabla: pd.DataFrame, gw: float, col, dia
         estilo(ax)
     axs[0].legend(frameon=False, fontsize=8, loc="center left", bbox_to_anchor=(0.02, 0.6),
                   labelcolor=TINTA_2)
-    fig.suptitle(f"OMIE aggregate curves, {dia:%d/%m/%Y} (complex bids excluded; prices at −500 and "
+    fig.suptitle(f"OMIE aggregate curves, {dia:%d/%m/%Y} (complex bids: accepted volume; prices at −500 and "
                  f"{PRECIO_MAX:g} €/MWh off the axis)", x=0.01, ha="left", color=TINTA_2, fontsize=9)
     fig.tight_layout()
     fig.savefig(salida, dpi=150)

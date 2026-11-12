@@ -13,12 +13,16 @@ la comprueba contra el precio que publico OMIE):
 
 * Tipo Oferta: V = venta (curva de oferta), C = compra (curva de demanda).
 * Potencia en MW y precio en €/MWh, con coma decimal y punto de millar ("1.991,1").
-* O = ofertada, C = casada. Las filas casadas repiten parte de las ofertadas, asi que
-  la curva se construye solo con las O.
+* O = ofertada, C = casada. Las filas casadas repiten parte de las ofertadas. Se guardan
+  las O, los flujos de interconexion y, de las ofertas complejas, tambien las casadas
+  (columna `casada`), porque `precios` las necesita (ver supuestos).
 * Tipologia: S = oferta simple; C01, C02, ... = ofertas con condiciones complejas (el
-  algoritmo puede rechazarlas enteras, asi que el cruce de las curvas es aproximado);
-  "Imp XX" / "Exp XX" = flujo de interconexion ya casado (no es una oferta mas). Sus MW
-  son reales: con ellos el cruce cae sobre el precio publicado.
+  algoritmo puede aceptarlas o rechazarlas enteras, no siguen la curva); "Imp XX" /
+  "Exp XX" = flujo de interconexion ya casado (no es una oferta mas). Sus MW son reales:
+  con ellos el cruce cae sobre el precio publicado.
+* Periodo: un numero (1, 2, ...) en los ficheros horarios; en los cuarto-horarios (desde el
+  01/10/2025) una etiqueta HxQy, hora x y cuarto y (H1Q1 ... H24Q4), que es el periodo
+  (x - 1) * 4 + y (comprobado en curva_pbc_20260913.1: 96 etiquetas, H1Q1 a H24Q4).
 * Pais: MI = mercado iberico. Si España y Portugal casan a precios distintos, ese
   periodo no trae MI sino una curva ES y otra PT, cada una con su flujo de interconexion
   (p. ej. "Exp ES" en la curva ES). Se usa ES si existe y si no MI; PT se descarta.
@@ -32,9 +36,14 @@ Supuestos de `precios` (revisables):
   precio. Con una bateria grande esto es una simplificacion.
 * La demanda extra (carga de bateria) entra como compra al precio maximo y la oferta
   extra (descarga) como venta al precio minimo: se casan siempre.
-* Por defecto se ignoran las ofertas complejas: el 15/05/2025, sin ellas y con la
-  curva ES/MI, el cruce cae a menos de 1 €/MWh del precio español en las 24 horas
-  (exacto en 17); con ellas se aleja hasta 31 €/MWh.
+* Ofertas complejas (complejas="casadas", por defecto): entran solo por el volumen que el
+  algoritmo de OMIE caso, a su precio; las simples, por todo lo ofertado. Es la construccion
+  que reproduce el precio publicado (|dif| maximo; periodos a menos de 0,01 €/MWh):
+      15/05/2025 (horario)       0,98 €/MWh; 17/24   (igual que sin complejas)
+      02/09/2026 (cuarto-hora)   1,23 €/MWh; 82/96   (sin complejas: 103 €/MWh; ofertadas: 51)
+      13/09/2026 (cuarto-hora)   1,38 €/MWh; 84/96   (sin complejas: 15 €/MWh; ofertadas: 45)
+  Con baterias, el volumen casado de las complejas se queda fijo, como el resto de ofertas.
+  "ofertadas" usa todo lo ofertado (simples y complejas) y "no" ignora las complejas.
 * La curva es la del precio español: con separacion de mercados el flujo ES-PT queda
   fijo, como los demas flujos.
 """
@@ -59,15 +68,29 @@ def nombre_fichero(dia: date) -> str:
     return f"curva_pbc_{dia:%Y%m%d}.1"
 
 
+def _es_dato(linea: str) -> bool:
+    return linea[:1].isdigit() or (linea[:1] == "H" and linea[1:2].isdigit())
+
+
+def _numero_periodo(p: pd.Series) -> pd.Series:
+    """'7' (horario) o 'H2Q3' (cuarto-horario: hora 2, cuarto 3, es decir periodo 7) -> numero."""
+    hq = p.str.extract(r"^H(\d+)Q([1-4])$").astype(float)
+    num = (hq[0] - 1) * 4 + hq[1]
+    num = num.fillna(pd.to_numeric(p, errors="coerce"))
+    if num.isna().any():
+        raise ValueError(f"periodos no reconocidos: {sorted(p[num.isna()].unique())[:5]}")
+    return num.astype(int)
+
+
 def parsear_curvas(texto: str) -> pd.DataFrame:
     """Convierte un curva_pbc en los escalones de la curva de cada periodo.
 
     Devuelve timestamp_utc, resolucion_min, lado ("oferta" o "demanda"), precio (€/MWh),
-    potencia_mw y tipologia, con un escalon por (periodo, lado, precio, tipologia).
-    Se quedan las filas ofertadas y los flujos de interconexion casados, de la curva
-    ES del periodo si la hay y si no de la MI.
+    potencia_mw, tipologia y casada, con un escalon por (periodo, lado, precio, tipologia,
+    casada). Se quedan las filas ofertadas, los flujos de interconexion casados y las filas
+    casadas de las ofertas complejas, de la curva ES del periodo si la hay y si no de la MI.
     """
-    lineas = [ln for ln in texto.splitlines() if ln[:1].isdigit()]
+    lineas = [ln for ln in texto.splitlines() if _es_dato(ln)]
     if not lineas:
         raise ValueError("fichero curva_pbc sin datos")
     df = pd.read_csv(
@@ -78,8 +101,9 @@ def parsear_curvas(texto: str) -> pd.DataFrame:
         names=["periodo", "fecha", "pais", "unidad", "tipo", "potencia_mw", "precio", "oc", "tipologia"],
         decimal=",",
         thousands=".",
-        dtype={"fecha": str, "pais": str, "tipo": str, "oc": str, "tipologia": str},
+        dtype={"periodo": str, "fecha": str, "pais": str, "tipo": str, "oc": str, "tipologia": str},
     )
+    df["periodo"] = _numero_periodo(df["periodo"].str.strip())
     fechas = df["fecha"].unique()
     if len(fechas) != 1:
         raise ValueError("un curva_pbc debe traer un solo dia")
@@ -99,10 +123,14 @@ def parsear_curvas(texto: str) -> pd.DataFrame:
 
     tipologia = df["tipologia"].fillna("")
     flujo = tipologia.str.startswith(("Imp", "Exp"))
-    df = df.loc[(df["oc"] == "O") | flujo].assign(
-        tipologia=tipologia, lado=lambda d: np.where(d["tipo"] == "C", "demanda", "oferta")
+    compleja_casada = (df["oc"] == "C") & tipologia.str.fullmatch(r"C\d+")
+    df = df.loc[(df["oc"] == "O") | flujo | compleja_casada].assign(
+        tipologia=tipologia,
+        casada=lambda d: d["oc"] == "C",
+        lado=lambda d: np.where(d["tipo"] == "C", "demanda", "oferta"),
     )
-    curva = df.groupby(["periodo", "lado", "precio", "tipologia"], as_index=False)["potencia_mw"].sum()
+    claves = ["periodo", "lado", "precio", "tipologia", "casada"]
+    curva = df.groupby(claves, as_index=False)["potencia_mw"].sum()
 
     t0 = inicio.tz_convert("UTC")
     curva.insert(0, "timestamp_utc", t0 + pd.to_timedelta((curva["periodo"] - 1) * resol, unit="min"))
@@ -149,19 +177,26 @@ def precio_equilibrio(
 
 
 def precios(
-    curvas: pd.DataFrame, delta_mw: pd.Series | None = None, complejas: bool = False
+    curvas: pd.DataFrame, delta_mw: pd.Series | None = None, complejas: str = "casadas"
 ) -> pd.DataFrame:
     """Precio de equilibrio de cada periodo, con la demanda opcionalmente desplazada.
 
     `curvas` es la salida de `parsear_curvas` (o de `cargar`). `delta_mw` es una serie
     indexada por timestamp_utc: positiva = demanda extra (carga de bateria, en MW de
-    la red), negativa = oferta extra (descarga). Por defecto se ignoran los escalones de
-    ofertas complejas (ver supuestos); `complejas=True` los incluye.
+    la red), negativa = oferta extra (descarga). `complejas` elige como entran las ofertas
+    complejas: "casadas" (por defecto, su volumen casado), "ofertadas" o "no" (ver supuestos).
 
     Devuelve timestamp_utc y precio_eur_mwh.
     """
-    if not complejas:
-        curvas = curvas[~curvas["tipologia"].str.fullmatch(r"C\d+")]
+    compleja = curvas["tipologia"].str.fullmatch(r"C\d+")
+    if complejas == "casadas":
+        curvas = curvas[~compleja | curvas["casada"]]
+    elif complejas == "ofertadas":
+        curvas = curvas[~compleja | ~curvas["casada"]]
+    elif complejas == "no":
+        curvas = curvas[~compleja]
+    else:
+        raise ValueError(f"complejas debe ser 'casadas', 'ofertadas' o 'no', no {complejas!r}")
     delta = {} if delta_mw is None else delta_mw.to_dict()
 
     filas = []

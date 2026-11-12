@@ -1,0 +1,2 @@
+dias_analizados,gw,ingreso_eur,ingreso_eur_mw,ingreso_eur_mw_dia,aceptante_1mw_eur_mw_dia,ciclos_por_dia,carga_inicio_pct,carga_fin_pct,variacion_carga_mwh,variacion_carga_valorada_eur,precio_medio_base,precio_medio_parque,spread_2h_base,spread_2h_parque,presupuesto_ciclos,ciclos_tramo1
+12,5.00,16824130.15,3364.83,280.40,381.91,0.96,20.62,66.88,4625.00,667854.18,143.61,144.40,212.06,165.11,14.00,14.00

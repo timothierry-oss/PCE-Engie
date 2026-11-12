@@ -23,3 +23,39 @@ simulacion:
   # Tamaño de cada tramo del parque (ver pce68.dispatch.flota). Mas pequeño = baterias
   # que compiten mejor; 0 = todo el parque en las mismas horas.
   paso_mw: 250
+
+simulacion_lp:
+  # Parque optimizado por programacion lineal sobre todo el periodo (scripts/06_simula_lp.py,
+  # supuestos en pce68.dispatch.lp). Prevision perfecta sobre los 14 dias: sobrestima.
+  desde: 2026-09-01
+  hasta: 2026-09-14
+  gw: 5
+  paso_mw: 250                    # 20 tramos, colocados uno tras otro, sin reoptimizar
+  carga_bordes: 0.5               # estado de carga al empezar el primer dia y al acabar el ultimo
+  dias_descartados: 1             # dias que se quitan de los resultados en cada extremo
+  # Presupuesto de ciclos = bateria.ciclos_maximos_anuales * dias / 365 (14 en 14 dias).
+  # Penalizacion (€/MWh) de carga y descarga para que el LP no cargue y descargue a la vez
+  # con precios negativos; tan pequeña que no cambia el plan en los demas casos.
+  penalizacion_eur_mwh: 0.001
+
+fundamentales:
+  # Indicadores ESIOS (scripts/07_descarga_fundamentales.py), columna: identificador.
+  # Identificadores encontrados en la web, SIN COMPROBAR: revisar el nombre oficial que imprime el
+  # script y buscar los que falten con --buscar (carbon, cogeneracion, bombeo, intercambios).
+  desde: 2026-09-01
+  hasta: 2026-09-14
+  indicadores:
+    demanda: 1293
+    eolica: 551
+    solar_fv: 1295
+    solar_termica: 1294
+    hidraulica: 546
+    hidraulica_gen: 2080
+    bombeo_turbinacion: 2079
+    bombeo_consumo: 2078
+    nuclear: 549
+    ciclo_combinado: 2041
+    carbon: 547
+    cogeneracion: 1297
+    intercambios: 553
+    precio_spot: 600
