@@ -38,12 +38,92 @@ simulacion_lp:
   # con precios negativos; tan pequeña que no cambia el plan en los demas casos.
   penalizacion_eur_mwh: 0.001
 
+rejilla:
+  # Panel de entrenamiento del documento del cliente (BESS-cannibalization): precio simulado p^X
+  # de cada cuarto de hora para una rejilla de potencias X (scripts/08_simula_rejilla.py). Una sola
+  # simulacion LP del parque mayor, con fotos en cada potencia (ver pce68.dispatch.lp.despacho_lp).
+  # Tramos, bordes, penalizacion y dias descartados: los de simulacion_lp.
+  desde: 2026-01-01
+  hasta: 2026-11-12
+  gw: [1, 2, 3, 5, 7.5, 10, 12.5, 15, 17]   # multiplos de paso_mw; 17 GW = PNIEC 2030
+  # y = p^X / p0 donde p0 != 0 y |p0| >= este umbral (€/MWh); si no, NaN. 0 = la definicion del
+  # documento del cliente (todo p0 != 0). Con p0 cerca de 0 el cociente explota o cambia de signo:
+  # a revisar con ENGIE (p^X y p0 se guardan siempre).
+  umbral_ratio_eur_mwh: 0.0
+
+modelo:
+  # Etapa 2 del documento BESS-cannibalization: y = f(t, X, z) sin identificador de dia
+  # (scripts/10_modelo_impacto.py, supuestos en pce68.modelo.impacto). Panel de la seccion rejilla.
+  # Validacion fuera de muestra: se deja fuera un mes entero cada vez (GroupKFold por mes).
+  # Periodos de entrenamiento: un panel de scripts/08_simula_rejilla.py por periodo (panel_bess_*.parquet,
+  # --desde/--hasta de ese script). Solo cuartos de hora: antes del 01/10/2025 OMIE publica por horas.
+  periodos:
+    - {desde: 2025-10-01, hasta: 2025-12-31}
+    - {desde: 2026-01-01, hasta: 2026-11-12}
+  # Fundamentales ESIOS usados (columnas de fundamentales.parquet); precio_spot no: es p0.
+  fundamentales: [demanda, eolica, solar_fv, solar_termica, hidraulica, nuclear, ciclo_combinado,
+                  cogeneracion, intercambios, bombeo_consumo, bombeo_turbinacion, demanda_residual]
+  alpha_ridge: 10.0               # penalizacion de la regresion ridge
+  # Ponderaciones que se entrenan y comparan (ver pce68.modelo.impacto): ninguna = minimos cuadrados
+  # en y; p0_cuadrado = peso p0^2, equivalente a minimizar el error en precio.
+  ponderaciones: [ninguna, p0_cuadrado]
+  gbm:                            # HistGradientBoostingRegressor de scikit-learn
+    max_iter: 300
+    learning_rate: 0.05
+    max_leaf_nodes: 31
+    min_samples_leaf: 200
+
+comparacion:
+  # scripts/11_compara_modelos.py: compara modelos de scripts/10_modelo_impacto.py sobre las MISMAS filas
+  # (las que comparten todos los entrenamientos). Lee data/processed/predicciones_cv_<sufijo>.parquet.
+  # sufijo = AAAAMMDD_AAAAMMDD del periodo de entrenamiento (primer desde, ultimo hasta de modelo.periodos).
+  entrenamientos:
+    - {nombre: "2026", sufijo: "20260101_20261112"}
+    - {nombre: "Q4 2025 + 2026", sufijo: "20251001_20261112"}
+  modelos: [gbm_delta, gbm_p0sq, ridge_delta, ridge_p0sq]
+
+prevision:
+  # scripts/12_ajusta_prevision.py: etapa 3 del documento BESS-cannibalization (p' = p^E + delta o ŷ·p^E)
+  # sobre la prevision de ENGIE. DATOS CONFIDENCIALES: la salida va a data/processed/, nunca a reports/.
+  archivo: data/forecast_base_case.xlsx
+  salida: data/processed/prevision_ajustada
+  entrenamiento: "20251001_20261112"   # sufijo de data/processed/modelo_impacto_<sufijo>.joblib
+  modelos: [gbm_delta, gbm_p0sq, ridge_delta]
+  gw: [5, 10, 17]                      # escenarios de potencia constante (dentro de lo visto: 1-17 GW)
+  respuesta_modelo: "20251001_20261112"  # sufijo de data/processed/respuesta_precio_<sufijo>.joblib (script 13)
+  # Entradas que la prevision no trae; null = mediana del periodo de entrenamiento (ver pce68.modelo.prevision)
+  supuestos: {gas_eur_mwh: null, co2_eur_t: null, bombeo_consumo_mw: null}
+
+respuesta:
+  # scripts/13_respuesta_precio.py: respuesta del precio a la potencia neta de las baterias, aprendida de las
+  # curvas de OMIE (pce68.modelo.respuesta) y usada con el LP en equilibrio (pce68.dispatch.equilibrio).
+  desde: 2025-10-01                 # periodos en cuartos de hora con curvas (OMIE: horario hasta 30/09/2025)
+  hasta: 2026-11-12
+  # niveles de potencia neta del parque (GW; + carga, - descarga) en los que se calcula el efecto exacto
+  niveles_gw: [-17, -12, -8, -5, -3, -2, -1, -0.5, 0, 0.5, 1, 2, 3, 5, 8, 12, 17]
+  validacion_desde: 2026-08-01      # meses de prueba: el modelo se entrena solo con lo anterior
+  validacion_gw: [2, 5, 10, 17]     # potencias comparadas con el simulador (panel de la rejilla)
+  paso_gw: 0.5                      # ancho de los tramos de potencia del LP de equilibrio (GW); mas fino = mas exacto y mas lento
+  gbm: {max_iter: 300, learning_rate: 0.05, max_leaf_nodes: 31, min_samples_leaf: 200}
+
+combustibles:
+  # scripts/09_descarga_combustibles.py: gas MIBGAS-ES (diario, €/MWh) y CO2 (mensual, €/t).
+  # Las curvas de OMIE estan desde el 01/01/2023: mismas fechas para poder entrenar con todo.
+  desde: 2023-01-01
+  hasta: null                     # null = hoy
+  # ESIOS 1391 "Precio de derechos de emision de despacho de los TNP (PCO2D)": un valor al mes,
+  # 74-79 €/t en 2026. SUPUESTO: aproxima el precio de mercado del CO2, pero es una serie muy
+  # suavizada (80-85 €/t todo 2023, 84 €/t en ene-2024) que parece una media movil con retraso,
+  # no el EUA diario. Sustituir por el EUA diario (EEX/ICE) si ENGIE lo facilita.
+  # (ESIOS 1940, gas para los TNP, no es un precio de mercado en €/MWh: no se usa.)
+  co2_esios: 1391
+
 fundamentales:
   # Indicadores ESIOS (scripts/07_descarga_fundamentales.py), columna: identificador.
   # Identificadores encontrados en la web, SIN COMPROBAR: revisar el nombre oficial que imprime el
   # script y buscar los que falten con --buscar (carbon, cogeneracion, bombeo, intercambios).
-  desde: 2026-09-01
-  hasta: 2026-09-14
+  desde: 2025-10-01               # 01/10/2025-12/11/2026: primer dia en cuartos de hora (OMIE) y rejilla 2026
+  hasta: 2026-11-12
   indicadores:
     demanda: 1293
     eolica: 551

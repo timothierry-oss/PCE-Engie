@@ -35,7 +35,7 @@ import pandas as pd
 from scipy import sparse
 from scipy.optimize import linprog
 
-from pce68.data.curvas import precios
+from pce68.data.curvas import CurvasPreparadas
 from pce68.dispatch.battery import Battery
 
 
@@ -76,24 +76,36 @@ def plan_lp(
 
 
 def despacho_lp(
-    curvas: pd.DataFrame, potencia_mw: float, bat: Battery, paso_mw: float, ciclos: float,
-    carga_bordes: float = 0.5, penalizacion: float = 1e-3,
+    curvas: CurvasPreparadas, potencia_mw: float, bat: Battery, paso_mw: float, ciclos: float,
+    carga_bordes: float = 0.5, penalizacion: float = 1e-3, fotos_mw: list[float] | None = None,
 ) -> pd.DataFrame:
     """Reparte un parque de `potencia_mw` en tramos de `paso_mw`, cada uno planificado con `plan_lp`.
+
+    `curvas` sale de curvas.preparar o curvas.preparar_dias. Tras colocar un tramo solo se
+    recalcula el precio de los periodos en los que carga o descarga (el resto no cambia).
 
     Devuelve timestamp_utc, resolucion_min, delta_mw (positivo = carga, como espera
     curvas.precios), carga_mwh (energia almacenada en todo el parque al final de cada periodo)
     y precio_eur_mwh con el parque. Ademas:
     attrs["tramos"]: tabla por tramo (tramo, mw, activo, margen_visto_eur_mw: el margen con los
     precios que vio al colocarse) y attrs["planes"]: perfil de cada tramo (MW por MW instalado).
+
+    Como ningun tramo se reoptimiza, los primeros tramos de un parque grande son exactamente el
+    parque mas pequeño. Con `fotos_mw` (potencias acumuladas, multiplos de `paso_mw`) se guarda en
+    attrs["fotos"] {mw: DataFrame delta_mw, carga_mwh, precio_eur_mwh} el estado tras colocar esa
+    potencia: una sola simulacion da toda una rejilla de parques.
     """
     if paso_mw <= 0:
         raise ValueError("paso_mw debe ser positivo")
-    periodos = curvas[["timestamp_utc", "resolucion_min"]].drop_duplicates().sort_values("timestamp_utc")
-    ts = pd.DatetimeIndex(periodos["timestamp_utc"])
+    fotos_pedidas = sorted(float(x) for x in (fotos_mw or []))
+    if any(x <= 0 or x > potencia_mw + 1e-9 for x in fotos_pedidas):
+        raise ValueError("cada foto debe estar entre 0 (excluido) y potencia_mw")
+    fotos = {}
+    periodos = curvas.periodos
+    n = len(periodos)
     h = periodos["resolucion_min"].to_numpy(float) / 60.0
-    delta, carga = np.zeros(len(ts)), np.zeros(len(ts))
-    p = precios(curvas, pd.Series(delta, index=ts))["precio_eur_mwh"].to_numpy(float)
+    delta, carga = np.zeros(n), np.zeros(n)
+    p = curvas.precios(delta)
 
     planes, tramos = [], []
     restante = float(potencia_mw)
@@ -105,14 +117,23 @@ def despacho_lp(
         if activo:
             delta += q * perfil
             carga += q * s
-            p = precios(curvas, pd.Series(delta, index=ts))["precio_eur_mwh"].to_numpy(float)
+            cambia = np.flatnonzero(perfil)
+            p[cambia] = curvas.precios(delta, cambia)
         else:  # parado: guarda su carga de los bordes todo el periodo
-            perfil = np.zeros(len(ts))
+            perfil = np.zeros(n)
             carga += q * carga_bordes * bat.duracion_horas
         planes.append(perfil)
         tramos.append({"tramo": len(tramos) + 1, "mw": q, "activo": activo, "margen_visto_eur_mw": margen})
+        colocado = float(potencia_mw) - restante
+        for x in fotos_pedidas:
+            if x not in fotos and colocado >= x - 1e-9:
+                if abs(colocado - x) > 1e-6:
+                    raise ValueError(f"la foto de {x:g} MW no cae al final de un tramo de {paso_mw:g} MW")
+                fotos[x] = pd.DataFrame({"delta_mw": delta.copy(), "carga_mwh": carga.copy(),
+                                         "precio_eur_mwh": p.copy()})
 
-    out = periodos.reset_index(drop=True).assign(delta_mw=delta, carga_mwh=carga, precio_eur_mwh=p)
+    out = periodos.reset_index(drop=True).assign(delta_mw=delta, carga_mwh=carga, precio_eur_mwh=p.copy())
     out.attrs["tramos"] = pd.DataFrame(tramos)
     out.attrs["planes"] = np.array(planes)
+    out.attrs["fotos"] = fotos
     return out

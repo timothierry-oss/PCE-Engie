@@ -46,11 +46,21 @@ Supuestos de `precios` (revisables):
   "ofertadas" usa todo lo ofertado (simples y complejas) y "no" ignora las complejas.
 * La curva es la del precio español: con separacion de mercados el flujo ES-PT queda
   fijo, como los demas flujos.
+* Ficheros antiguos (hasta marzo de 2025: cabecera "Hora" y SIN columna de tipologia; el
+  16/03/2025 aun es antiguo, el 01/04/2025 ya no): no se distinguen las ofertas complejas ni los
+  flujos. Hasta 13 GW de venta ofertada por debajo del precio no se casa (complejas rechazadas),
+  y con todo lo ofertado el cruce cae 10 a 100 €/MWh por debajo del precio publicado. Se usa
+  lo casado dentro de la zona casada y lo ofertado fuera (ver _curva_sin_tipologia); `complejas`
+  no cambia nada en estos dias. Comprobado (|dif| maximo; periodos a menos de 0,01 €/MWh):
+      17/01/2024 0,10; 22/24    17/07/2024 0,54; 21/24    16/03/2025 2,75; 18/24
+  Limite: por encima del precio casado entran tambien complejas que quizas se rechazarian, asi
+  que la oferta que encuentra la carga de las baterias puede estar algo sobrestimada.
 """
 
 from __future__ import annotations
 
 import io
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -121,7 +131,10 @@ def parsear_curvas(texto: str) -> pd.DataFrame:
     con_es = df.loc[df["pais"] == "ES", "periodo"].unique()
     df = df[np.where(df["periodo"].isin(con_es), df["pais"] == "ES", df["pais"] == "MI")]
 
-    tipologia = df["tipologia"].fillna("")
+    tipologia = df["tipologia"].fillna("").str.strip()
+    if not tipologia.astype(bool).any():
+        curva = _curva_sin_tipologia(df)
+        return _con_hora(curva, inicio, resol)
     flujo = tipologia.str.startswith(("Imp", "Exp"))
     compleja_casada = (df["oc"] == "C") & tipologia.str.fullmatch(r"C\d+")
     df = df.loc[(df["oc"] == "O") | flujo | compleja_casada].assign(
@@ -131,11 +144,43 @@ def parsear_curvas(texto: str) -> pd.DataFrame:
     )
     claves = ["periodo", "lado", "precio", "tipologia", "casada"]
     curva = df.groupby(claves, as_index=False)["potencia_mw"].sum()
+    return _con_hora(curva, inicio, resol)
 
+
+def _con_hora(curva: pd.DataFrame, inicio: pd.Timestamp, resol: float) -> pd.DataFrame:
     t0 = inicio.tz_convert("UTC")
     curva.insert(0, "timestamp_utc", t0 + pd.to_timedelta((curva["periodo"] - 1) * resol, unit="min"))
     curva["resolucion_min"] = int(resol)
     return curva.drop(columns="periodo").sort_values(["timestamp_utc", "lado", "precio"], ignore_index=True)
+
+
+def _curva_sin_tipologia(df: pd.DataFrame) -> pd.DataFrame:
+    """Curva de un fichero antiguo, sin columna de tipologia (ver supuestos del modulo).
+
+    Por (periodo, lado, precio): dentro de la zona casada (venta a precio < la venta casada mas
+    cara; compra a precio > la compra casada mas barata) cuenta solo lo casado; en ese precio
+    limite y mas alla, max(ofertado, casado), es decir lo ofertado. Asi las ofertas complejas
+    rechazadas, que no se pueden identificar, no entran por debajo del precio.
+    """
+    df = df.assign(lado=np.where(df["tipo"] == "C", "demanda", "oferta"))
+    vol = (df.pivot_table(index=["periodo", "lado", "precio"], columns="oc", values="potencia_mw",
+                          aggfunc="sum", fill_value=0.0)
+           .reindex(columns=["O", "C"], fill_value=0.0).reset_index())
+    casadas = vol[vol["C"] > 0]
+    lim = pd.concat([
+        casadas[casadas["lado"] == "oferta"].groupby("periodo")["precio"].max().rename("oferta"),
+        casadas[casadas["lado"] == "demanda"].groupby("periodo")["precio"].min().rename("demanda"),
+    ], axis=1)
+    lim_of = vol["periodo"].map(lim["oferta"]).fillna(-np.inf).to_numpy()
+    lim_de = vol["periodo"].map(lim["demanda"]).fillna(np.inf).to_numpy()
+    es_oferta = (vol["lado"] == "oferta").to_numpy()
+    p = vol["precio"].to_numpy(float)
+    dentro = np.where(es_oferta, p < lim_of, p > lim_de)
+    vol["potencia_mw"] = np.where(dentro, vol["C"], np.maximum(vol["O"], vol["C"]))
+    vol["tipologia"] = ""
+    vol["casada"] = dentro
+    cols = ["periodo", "lado", "precio", "tipologia", "casada", "potencia_mw"]
+    return vol.loc[vol["potencia_mw"] > 0, cols].reset_index(drop=True)
 
 
 def cargar(carpeta: Path, dias: list[date] | None = None) -> pd.DataFrame:
@@ -176,6 +221,83 @@ def precio_equilibrio(
     return float(np.clip(candidatos[cubre[0]], PRECIO_MIN, PRECIO_MAX))
 
 
+@dataclass
+class CurvasPreparadas:
+    """Escalones de cada periodo ya listos para `precio_equilibrio`, sin pandas.
+
+    Se preparan una vez (`preparar`, `preparar_dias`) y luego el precio de cada periodo se
+    recalcula solo donde cambia la potencia de las baterias: el precio de un periodo solo
+    depende de su propio delta. `oferta[i]` y `demanda[i]` son (precios, MW) del periodo i,
+    con los flujos casados ya puestos en los extremos de precio.
+    """
+
+    periodos: pd.DataFrame  # timestamp_utc, resolucion_min, en orden temporal
+    oferta: list[tuple[np.ndarray, np.ndarray]]
+    demanda: list[tuple[np.ndarray, np.ndarray]]
+
+    def precios(self, delta_mw: np.ndarray | None = None, indices=None) -> np.ndarray:
+        """Precio de cada periodo (o de los de `indices`) con `delta_mw` (positivo = demanda extra)."""
+        idx = range(len(self.oferta)) if indices is None else indices
+        out = np.empty(len(idx))
+        for k, i in enumerate(idx):
+            (p_of, q_of), (p_de, q_de) = self.oferta[i], self.demanda[i]
+            extra = 0.0 if delta_mw is None else float(delta_mw[i])
+            if extra > 0:
+                p_de, q_de = np.append(p_de, PRECIO_MAX), np.append(q_de, extra)
+            elif extra < 0:
+                p_of, q_of = np.append(p_of, PRECIO_MIN), np.append(q_of, -extra)
+            out[k] = precio_equilibrio(p_of, q_of, p_de, q_de)
+        return out
+
+
+def preparar(curvas: pd.DataFrame, complejas: str = "casadas") -> CurvasPreparadas:
+    """Prepara las curvas de `parsear_curvas` (o `cargar`); `complejas` como en `precios`."""
+    compleja = curvas["tipologia"].str.fullmatch(r"C\d+")
+    if complejas == "casadas":
+        curvas = curvas[~compleja | curvas["casada"]]
+    elif complejas == "ofertadas":
+        curvas = curvas[~compleja | ~curvas["casada"]]
+    elif complejas == "no":
+        curvas = curvas[~compleja]
+    else:
+        raise ValueError(f"complejas debe ser 'casadas', 'ofertadas' o 'no', no {complejas!r}")
+
+    # todo vectorizado sobre el dia y luego troceado por periodo (mucho mas rapido que un groupby)
+    curvas = curvas.sort_values("timestamp_utc", kind="stable")
+    es_oferta = (curvas["lado"] == "oferta").to_numpy()
+    tip = curvas["tipologia"]
+    precio = curvas["precio"].to_numpy(float)
+    precio = np.where(es_oferta & tip.str.startswith("Imp").to_numpy(), -_INFINITO, precio)
+    precio = np.where(~es_oferta & tip.str.startswith("Exp").to_numpy(), _INFINITO, precio)
+    mw = curvas["potencia_mw"].to_numpy(float)
+    ts = pd.to_datetime(curvas["timestamp_utc"], utc=True).dt.tz_localize(None).to_numpy("datetime64[ns]")
+    cortes = np.flatnonzero(ts[1:] != ts[:-1]) + 1
+
+    oferta, demanda = [], []
+    for g in np.split(np.arange(len(ts)), cortes):
+        o, d = g[es_oferta[g]], g[~es_oferta[g]]
+        oferta.append((precio[o], mw[o]))
+        demanda.append((precio[d], mw[d]))
+    inicios = np.concatenate([[0], cortes]) if len(ts) else np.array([], int)
+    tabla = curvas.iloc[inicios][["timestamp_utc", "resolucion_min"]].reset_index(drop=True)
+    return CurvasPreparadas(tabla, oferta, demanda)
+
+
+def preparar_dias(carpeta: Path, dias: list[date], complejas: str = "casadas") -> CurvasPreparadas:
+    """Como `preparar(cargar(carpeta, dias))`, pero dia a dia: no junta todas las curvas en memoria."""
+    partes = []
+    for d in sorted(dias):
+        ruta = carpeta / f"curvas_{d:%Y%m%d}.parquet"
+        if not ruta.exists():
+            raise FileNotFoundError(f"no hay curvas de {d} en {carpeta}")
+        partes.append(preparar(pd.read_parquet(ruta), complejas))
+    return CurvasPreparadas(
+        pd.concat([p.periodos for p in partes], ignore_index=True),
+        [x for p in partes for x in p.oferta],
+        [x for p in partes for x in p.demanda],
+    )
+
+
 def precios(
     curvas: pd.DataFrame, delta_mw: pd.Series | None = None, complejas: str = "casadas"
 ) -> pd.DataFrame:
@@ -188,29 +310,7 @@ def precios(
 
     Devuelve timestamp_utc y precio_eur_mwh.
     """
-    compleja = curvas["tipologia"].str.fullmatch(r"C\d+")
-    if complejas == "casadas":
-        curvas = curvas[~compleja | curvas["casada"]]
-    elif complejas == "ofertadas":
-        curvas = curvas[~compleja | ~curvas["casada"]]
-    elif complejas == "no":
-        curvas = curvas[~compleja]
-    else:
-        raise ValueError(f"complejas debe ser 'casadas', 'ofertadas' o 'no', no {complejas!r}")
-    delta = {} if delta_mw is None else delta_mw.to_dict()
-
-    filas = []
-    for ts, g in curvas.groupby("timestamp_utc", sort=True):
-        of = g[g["lado"] == "oferta"]
-        de = g[g["lado"] == "demanda"]
-        p_of = np.where(of["tipologia"].str.startswith("Imp"), -_INFINITO, of["precio"].to_numpy(float))
-        p_de = np.where(de["tipologia"].str.startswith("Exp"), _INFINITO, de["precio"].to_numpy(float))
-        q_of, q_de = of["potencia_mw"].to_numpy(float), de["potencia_mw"].to_numpy(float)
-
-        extra = float(delta.get(ts, 0.0))
-        if extra > 0:
-            p_de, q_de = np.append(p_de, PRECIO_MAX), np.append(q_de, extra)
-        elif extra < 0:
-            p_of, q_of = np.append(p_of, PRECIO_MIN), np.append(q_of, -extra)
-        filas.append((ts, precio_equilibrio(p_of, q_of, p_de, q_de)))
-    return pd.DataFrame(filas, columns=["timestamp_utc", "precio_eur_mwh"])
+    prep = preparar(curvas, complejas)
+    ts = prep.periodos["timestamp_utc"]
+    delta = None if delta_mw is None else ts.map(delta_mw.to_dict()).fillna(0.0).to_numpy(float)
+    return pd.DataFrame({"timestamp_utc": ts, "precio_eur_mwh": prep.precios(delta)})

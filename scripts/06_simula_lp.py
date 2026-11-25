@@ -1,8 +1,10 @@
 """Simula un parque de baterias planificado por LP sobre varios dias y compara antes/despues.
 
     uv run python scripts/06_simula_lp.py
+    uv run python scripts/06_simula_lp.py --desde 2026-01-01 --hasta 2026-11-12
 
-Periodo, GW, tramos y bordes en config/base.yaml (seccion simulacion_lp); bateria en la seccion
+Periodo (por defecto; --desde/--hasta lo cambian), GW, tramos y bordes en config/base.yaml
+(seccion simulacion_lp); bateria en la seccion
 bateria. Hacen falta las curvas de todos los dias (scripts/02_descarga_curvas.py). Los supuestos
 estan en pce68.dispatch.lp. Guarda en reports/simulacion_lp/ (AAAAMMDD = primer y ultimo dia):
 
@@ -38,7 +40,7 @@ import yaml
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, Reference
 
-from pce68.data.curvas import cargar, precios
+from pce68.data.curvas import preparar_dias
 from pce68.dispatch.battery import Battery
 from pce68.dispatch.lp import despacho_lp
 from pce68.excel import F_NOTA, F_TIT, F_TXT
@@ -117,13 +119,27 @@ def figura_perfil(t: pd.DataFrame, gw: float, descartados: list, titulo: str, sa
 
 def figura_carga(t: pd.DataFrame, dias: pd.DataFrame, capacidad_mwh: float, salida: Path) -> None:
     fig, (ax, ax2) = plt.subplots(2, 1, figsize=(13, 6.5), height_ratios=[3, 2])
-    ax.plot(t["local"].dt.tz_localize(None), 100 * t["carga_mwh"] / capacidad_mwh, color=AZUL, lw=1.2)
+    if t["dia"].nunique() > 31:  # al cuarto de hora, mas de un mes es ilegible: banda diaria
+        d = por_dia(t, capacidad_mwh)
+        ax.fill_between(d.index, d["soc_min"], d["soc_max"], step="mid", color=AZUL, alpha=0.2, lw=0,
+                        label="range within the day")
+        ax.step(d.index, d["soc_fin"], where="mid", color=AZUL, lw=1.2, label="at midnight")
+        ax.legend(frameon=False, fontsize=9, labelcolor=TINTA_2, loc="lower right", bbox_to_anchor=(1, 1.0),
+                  ncols=2)
+        ax.set_title("Energy stored in the fleet (daily range and value at midnight)", loc="left",
+                     color=TINTA, fontsize=12)
+        _eje_fechas(ax)
+    else:
+        ax.plot(t["local"].dt.tz_localize(None), 100 * t["carga_mwh"] / capacidad_mwh, color=AZUL, lw=1.2)
+        ax.set_title("Energy stored in the fleet (end of each quarter-hour)", loc="left", color=TINTA,
+                     fontsize=12)
     ax.set_ylim(0, 100)
     ax.set_ylabel("% of fleet energy capacity", color=TINTA_2)
-    ax.set_title("Energy stored in the fleet (end of each quarter-hour)", loc="left", color=TINTA,
-                 fontsize=12)
     a = dias[dias["analizado"]]
-    ax2.bar([f"{d:%d/%m}" for d in a["dia"]], a["ingreso_eur_mw"], color=NARANJA)
+    ax2.bar(pd.to_datetime(a["dia"]), a["ingreso_eur_mw"], width=0.8, color=NARANJA)
+    localizador = mdates.AutoDateLocator()
+    ax2.xaxis.set_major_locator(localizador)
+    ax2.xaxis.set_major_formatter(mdates.ConciseDateFormatter(localizador))
     ax2.set_ylabel("€/MW installed", color=TINTA_2)
     ax2.set_title("Daily arbitrage revenue per installed MW (analysed days)", loc="left", color=TINTA_2,
                   fontsize=10)
@@ -184,26 +200,87 @@ COLUMNAS_TRAMOS = {
 }
 
 
+def por_dia(t: pd.DataFrame, capacidad_mwh: float) -> pd.DataFrame:
+    """Por dia: estado de carga minimo, maximo y a las 24:00 (%) y energia cargada/descargada (GWh)."""
+    h = t["resolucion_min"].to_numpy(float) / 60
+    g = pd.DataFrame({
+        "dia": pd.to_datetime(t["dia"]),
+        "soc": 100 * t["carga_mwh"].to_numpy(float) / capacidad_mwh,
+        "cargada": np.clip(t["mw"].to_numpy(float), 0, None) * h / 1000,
+        "descargada": np.clip(t["mw"].to_numpy(float), None, 0) * h / 1000,
+    }).groupby("dia")
+    return pd.DataFrame({"soc_min": g["soc"].min(), "soc_max": g["soc"].max(), "soc_fin": g["soc"].last(),
+                         "cargada_gwh": g["cargada"].sum(), "descargada_gwh": g["descargada"].sum()})
+
+
+def _eje_fechas(ax) -> None:
+    localizador = mdates.AutoDateLocator()
+    ax.xaxis.set_major_locator(localizador)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(localizador))
+
+
+def figura_bateria_diaria(t: pd.DataFrame, capacidad_mwh: float, descartados: list, titulo: str,
+                          salida: Path) -> None:
+    d = por_dia(t, capacidad_mwh)
+    fig, (ax, ax2) = plt.subplots(2, 1, figsize=(14, 8.5), sharex=True)
+    ax.fill_between(d.index, d["soc_min"], d["soc_max"], step="mid", color=AZUL, alpha=0.2, lw=0,
+                    label="range within the day (min to max)")
+    ax.step(d.index, d["soc_fin"], where="mid", color=AZUL, lw=1.3, label="at midnight (end of the day)")
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("% of energy capacity", color=TINTA_2)
+    ax.set_title(f"1. State of charge of the fleet, {titulo}", loc="left", color=TINTA, fontsize=12)
+    ax.legend(frameon=False, fontsize=9, labelcolor=TINTA_2, loc="lower right", bbox_to_anchor=(1, 1.0),
+              ncols=2)
+    ax2.bar(d.index, d["cargada_gwh"], width=1.0, color=AZUL, lw=0, label="charged: the fleet buys")
+    ax2.bar(d.index, d["descargada_gwh"], width=1.0, color=NARANJA, lw=0, label="discharged: the fleet sells")
+    ax2.axhline(0, color="#c3c2b7", lw=1)
+    ax2.set_ylabel("GWh per day", color=TINTA_2)
+    ax2.set_title("2. Energy charged and discharged each day", loc="left", color=TINTA, fontsize=12)
+    ax2.legend(frameon=False, fontsize=9, labelcolor=TINTA_2, loc="lower right", bbox_to_anchor=(1, 1.0),
+               ncols=2)
+    _eje_fechas(ax2)
+    for a in (ax, ax2):
+        for dia in descartados:
+            inicio = pd.Timestamp(dia)
+            medio_dia = pd.Timedelta(hours=12)
+            a.axvspan(inicio - medio_dia, inicio + medio_dia, color=MUDO, alpha=0.25, lw=0)
+        estilo(a)
+    fig.text(0.01, 0.01,
+             "How to read it: one point or bar per day. Panel 1: the shaded band shows how far the stored "
+             "energy goes up and down within each day\n(usually from near 0 % to 100 %: about one full cycle "
+             "a day); the line is what is left at midnight and carried to the next day.\n"
+             f"Panel 2: energy bought (blue) and sold (orange) each day; bought > sold because of losses. "
+             f"100 % = {capacidad_mwh:,.0f} MWh. Grey: boundary days, excluded. Perfect foresight.",
+             fontsize=9, color=TINTA_2, va="bottom")
+    fig.tight_layout(rect=(0, 0.07, 1, 1))
+    fig.savefig(salida, dpi=150)
+    plt.close(fig)
+
+
 def figura_bateria(t: pd.DataFrame, capacidad_mwh: float, descartados: list, titulo: str,
                    salida: Path) -> None:
+    if t["dia"].nunique() > 31:  # al cuarto de hora, mas de un mes es ilegible
+        figura_bateria_diaria(t, capacidad_mwh, descartados, titulo, salida)
+        return
     x = t["local"].dt.tz_localize(None)
     gw = t["mw"] / 1000
     soc = 100 * t["carga_mwh"] / capacidad_mwh
-    fig, (ax, ax2) = plt.subplots(2, 1, figsize=(14, 7.5), sharex=True)
+    fig, (ax, ax2) = plt.subplots(2, 1, figsize=(14, 8.5), sharex=True)
     ax.fill_between(x, soc, 0, step="post", color=AZUL, alpha=0.2, lw=0)
-    ax.step(x, soc, where="post", color=AZUL, lw=1.3)
+    ax.step(x, soc, where="post", color=AZUL, lw=1.3, label="energy stored in the fleet")
     ax.set_ylim(0, 100)
     ax.set_ylabel("% of energy capacity", color=TINTA_2)
-    ax.set_title(f"Battery fleet state of charge, {titulo} (end of each quarter-hour)", loc="left",
-                 color=TINTA, fontsize=12)
-    ax2.fill_between(x, gw.clip(lower=0), 0, step="post", color=AZUL, lw=0, label="charging (extra demand)")
+    ax.set_title(f"1. State of charge of the fleet, {titulo}", loc="left", color=TINTA, fontsize=12)
+    ax.legend(frameon=False, fontsize=9, labelcolor=TINTA_2, loc="lower right", bbox_to_anchor=(1, 1.0))
+    ax2.fill_between(x, gw.clip(lower=0), 0, step="post", color=AZUL, lw=0,
+                     label="charging: the fleet buys (extra demand)")
     ax2.fill_between(x, gw.clip(upper=0), 0, step="post", color=NARANJA, lw=0,
-                     label="discharging (extra supply)")
+                     label="discharging: the fleet sells (extra supply)")
     ax2.axhline(0, color="#c3c2b7", lw=1)
     ax2.set_ylabel("GW on the grid", color=TINTA_2)
-    ax2.set_title("Charging and discharging power of the fleet. Grey bands: boundary days, excluded from the "
-                  "results", loc="left", color=TINTA_2, fontsize=10)
-    ax2.legend(frameon=False, fontsize=9, labelcolor=TINTA_2, loc="lower left", ncols=2)
+    ax2.set_title("2. Charging and discharging power", loc="left", color=TINTA, fontsize=12)
+    ax2.legend(frameon=False, fontsize=9, labelcolor=TINTA_2, loc="lower right", bbox_to_anchor=(1, 1.0),
+               ncols=2)
     ax2.xaxis.set_major_locator(mdates.DayLocator())
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))
     for a in (ax, ax2):
@@ -211,7 +288,14 @@ def figura_bateria(t: pd.DataFrame, capacidad_mwh: float, descartados: list, tit
             inicio = pd.Timestamp(d)
             a.axvspan(inicio, inicio + pd.Timedelta(days=1), color=MUDO, alpha=0.12, lw=0)
         estilo(a)
-    fig.tight_layout()
+    fig.text(0.01, 0.01,
+             "How to read it: each day the fleet charges in the midday solar trough (blue, panel 2) "
+             "until the stored energy reaches 100 % (panel 1),\nthen discharges in the evening and early "
+             "morning (orange). When panel 1 stays high at midnight, energy is carried to the next day.\n"
+             f"100 % = {capacidad_mwh:,.0f} MWh. Grey bands: boundary days (start and end at 50 %), excluded "
+             "from the results. Perfect foresight of prices over the whole period.",
+             fontsize=9, color=TINTA_2, va="bottom")
+    fig.tight_layout(rect=(0, 0.07, 1, 1))
     fig.savefig(salida, dpi=150)
     plt.close(fig)
 
@@ -257,6 +341,126 @@ def _serie(ws, col: int, fila0: int, fila1: int, titulo: str):
     from openpyxl.chart import Series
 
     return Series(Reference(ws, min_col=col, min_row=fila0, max_row=fila1), title=titulo)
+
+
+def hoja_bateria(wb, t: pd.DataFrame, dias: pd.DataFrame, capacidad: float) -> None:
+    """Pestaña Battery: grafico de carga/descarga y estado de carga, texto para leerlo y sus datos."""
+    ws = wb.create_sheet("Battery")
+    ws.sheet_view.showGridLines = False
+    ws["A1"] = "Battery fleet: charging, discharging and state of charge"
+    ws["A1"].font = F_TIT
+
+    # datos del grafico debajo de el (fila 40), con carga y descarga en series separadas. Para mas de
+    # un mes, un punto por dia: 96 barras por dia serian ilegibles (y pesadas para Excel)
+    fila_tabla = 40
+    diario = t["dia"].nunique() > 31
+    if diario:
+        h = t["resolucion_min"].to_numpy(float) / 60
+        e = pd.DataFrame({"dia": t["dia"], "c": t["mw"].clip(lower=0) * h, "d": t["mw"].clip(upper=0) * h})
+        e = e.groupby("dia").sum()
+        b = pd.DataFrame({
+            "Day": [f"{pd.Timestamp(x):%d/%m}" for x in e.index],
+            "Energy charged (MWh)": e["c"].to_numpy(),
+            "Energy discharged (MWh)": e["d"].to_numpy(),
+            "Stored energy at 24:00 (% of capacity)": (100 * t.groupby("dia")["carga_mwh"].last()
+                                                         / capacidad).to_numpy(),
+        })
+        salto, eje_x, eje_y = 7, "day (one label per week)", "MWh per day (+ charged, − discharged)"
+    else:
+        b = pd.DataFrame({
+            "Time (local)": t["local"].dt.strftime("%d/%m %H:%M").to_numpy(),
+            "Charging (MW)": t["mw"].clip(lower=0).to_numpy(),
+            "Discharging (MW)": t["mw"].clip(upper=0).to_numpy(),
+            "State of charge (% of capacity)": (100 * t["carga_mwh"] / capacidad).to_numpy(),
+        })
+        salto, eje_x = 96, "local time (one label per day, at 00:00)"
+        eje_y = "MW on the grid (+ charging, − discharging)"
+    ws.cell(row=fila_tabla - 1, column=1, value="Chart data").font = F_TIT
+    fin = tabla_excel(ws, fila_tabla, b, {c: "#,##0.0" for c in b.columns[1:]})
+
+    barras = BarChart()
+    barras.type, barras.grouping, barras.overlap, barras.gapWidth = "col", "stacked", 100, 0
+    barras.title, barras.height, barras.width = "Battery fleet: power and state of charge", 16, 30
+    for j, color in ((2, AZUL), (3, NARANJA)):
+        barras.add_data(Reference(ws, min_col=j, min_row=fila_tabla, max_row=fin), titles_from_data=True)
+        s = barras.series[-1]
+        s.invertIfNegative = False
+        s.graphicalProperties.solidFill = color.lstrip("#")
+        s.graphicalProperties.line.solidFill = color.lstrip("#")
+    barras.set_categories(Reference(ws, min_col=1, min_row=fila_tabla + 1, max_row=fin))
+    barras.y_axis.title, barras.x_axis.title = eje_y, eje_x
+    barras.x_axis.tickLblSkip = barras.x_axis.tickMarkSkip = salto
+    linea = LineChart()
+    linea.add_data(Reference(ws, min_col=4, min_row=fila_tabla, max_row=fin), titles_from_data=True)
+    linea.series[0].graphicalProperties.line.solidFill = TINTA.lstrip("#")
+    linea.series[0].graphicalProperties.line.width = 19050  # 1,5 pt
+    linea.series[0].smooth = False
+    linea.y_axis.axId = 200
+    linea.y_axis.title = "Stored energy (% of capacity)"
+    linea.y_axis.scaling.min, linea.y_axis.scaling.max = 0, 100
+    linea.y_axis.crosses = "max"
+    barras.x_axis.delete = barras.y_axis.delete = linea.y_axis.delete = False
+    barras += linea
+    barras.legend.position = "b"
+    ws.add_chart(barras, "A3")
+
+    # texto para leer el grafico, a su derecha
+    a = dias[dias["analizado"]]
+    noche = a[a["carga_fin_mwh"] >= 0.5 * capacidad]
+    if len(noche) <= 10:
+        llevado = "Analysed days ending at 50 % or more: " + (", ".join(
+            f"{pd.Timestamp(d):%d/%m} ({100 * c / capacidad:.0f} %)"
+            for d, c in zip(noche["dia"], noche["carga_fin_mwh"], strict=True)) or "none") + "."
+    else:
+        llevado = f"{len(noche)} of the {len(a)} analysed days end at 50 % or more (Days sheet)."
+    if diario:
+        lectura = [
+            ("Blue bars, above zero: energy the fleet CHARGED that day. It buys electricity, which", F_TXT),
+            ("adds demand on the market (MWh, left axis).", F_TXT),
+            ("Orange bars, below zero: energy the fleet DISCHARGED that day. It sells electricity,", F_TXT),
+            ("which adds supply on the market (MWh, left axis).", F_TXT),
+            ("Dark line: energy left in the whole fleet at midnight (end of each day), as a % of its", F_TXT),
+            (f"capacity (right axis, 0-100 %; 100 % = {capacidad:,.0f} MWh).", F_TXT),
+            ("", F_TXT),
+            ("What it shows", F_TIT),
+            ("One day per bar. Charged energy is larger than discharged energy because of the", F_TXT),
+            ("losses (round-trip efficiency). Small bars: days with little to gain (flat prices) or", F_TXT),
+            ("days where the cycle budget is kept for better days.", F_TXT),
+            ("When the line is high, energy is carried over to the next day.", F_TXT),
+            ("For the quarter-hour detail, see the Quarter-hours sheet and bateria_*.png.", F_TXT),
+        ]
+    else:
+        lectura = [
+            ("Blue bars, above zero: the fleet is CHARGING. It buys electricity, which adds demand", F_TXT),
+            ("on the market (MW, left axis).", F_TXT),
+            ("Orange bars, below zero: the fleet is DISCHARGING. It sells electricity, which adds", F_TXT),
+            ("supply on the market (MW, left axis).", F_TXT),
+            ("Dark line: energy stored in the whole fleet at the end of each quarter-hour, as a % of", F_TXT),
+            (f"its capacity (right axis, 0-100 %; 100 % = {capacidad:,.0f} MWh).", F_TXT),
+            ("", F_TXT),
+            ("What it shows", F_TIT),
+            ("Each day the fleet charges in the midday solar trough, when prices are low, until the", F_TXT),
+            ("line reaches 100 %. It then discharges in the evening and early morning, when prices", F_TXT),
+            ("are high, and the line falls back.", F_TXT),
+            ("When the line stays high at midnight, energy is carried over to the next day.", F_TXT),
+        ]
+    textos = [
+        ("How to read this chart", F_TIT),
+        *lectura,
+        (llevado, F_TXT),
+        (f"Maximum charging power: {t['mw'].max():,.0f} MW; maximum discharging power: "
+         f"{-t['mw'].min():,.0f} MW.", F_TXT),
+        ("", F_TXT),
+        ("Good to know", F_TIT),
+        ("The first and last days are boundary days: the fleet must start and end at 50 %.", F_TXT),
+        ("They are excluded from all totals (Summary and Days sheets).", F_TXT),
+        ("Plan computed with perfect foresight of prices over the whole period.", F_TXT),
+        (f"Data of the chart: table below it (row {fila_tabla}); more columns in the Quarter-hours sheet.",
+         F_NOTA),
+    ]
+    for i, (txt, fuente) in enumerate(textos):
+        ws.cell(row=3 + i, column=15, value=txt or None).font = fuente
+    ws.column_dimensions["O"].width = 92
 
 
 def exporta_excel(t, dias, tramos, resumen, fund, params: dict, capacidad: float, salida: Path) -> None:
@@ -385,35 +589,7 @@ def exporta_excel(t, dias, tramos, resumen, fund, params: dict, capacidad: float
     ch.x_axis.delete = ch.y_axis.delete = False
     ws.add_chart(ch, "W4")
 
-    # Estado de carga y potencia del parque, con los datos de Quarter-hours
-    qh, col = ws, {c: j for j, c in enumerate(q.columns, start=1)}
-    ws = wb.create_sheet("Battery")
-    ws.sheet_view.showGridLines = False
-    ws["A1"] = "Battery fleet: charging, discharging and state of charge"
-    ws["A2"] = ("Bars: fleet power on the grid (MW, positive = charging, negative = discharging). "
-                "Line: stored energy (% of capacity, right axis). Data in the Quarter-hours sheet.")
-    ws["A1"].font, ws["A2"].font = F_TIT, F_NOTA
-    barras = BarChart()
-    barras.type, barras.gapWidth = "col", 0
-    barras.title, barras.height, barras.width = "Fleet power and state of charge", 15, 42
-    barras.add_data(Reference(qh, min_col=col["Fleet power (MW)"], min_row=4, max_row=fin),
-                    titles_from_data=True)
-    barras.series[0].invertIfNegative = False
-    barras.series[0].graphicalProperties.solidFill = AZUL.lstrip("#")
-    barras.series[0].graphicalProperties.line.solidFill = AZUL.lstrip("#")
-    barras.set_categories(Reference(qh, min_col=1, min_row=5, max_row=fin))
-    barras.y_axis.title = "MW on the grid"
-    linea = LineChart()
-    linea.add_data(Reference(qh, min_col=col["Stored energy (% of capacity)"], min_row=4, max_row=fin),
-                   titles_from_data=True)
-    linea.series[0].graphicalProperties.line.solidFill = NARANJA.lstrip("#")
-    linea.y_axis.axId = 200
-    linea.y_axis.title = "% of energy capacity"
-    linea.y_axis.scaling.min, linea.y_axis.scaling.max = 0, 100
-    linea.y_axis.crosses = "max"
-    barras.x_axis.delete = barras.y_axis.delete = linea.y_axis.delete = False
-    barras += linea
-    ws.add_chart(barras, "A4")
+    hoja_bateria(wb, t, dias, capacidad)
     wb.move_sheet("Battery", offset=-(len(wb.sheetnames) - 3))  # justo despues de Summary
 
     wb.save(salida)
@@ -421,11 +597,13 @@ def exporta_excel(t, dias, tramos, resumen, fund, params: dict, capacidad: float
 
 def simula(sim: dict, bat: Battery, todos: list, analizados: list, ciclos: float, mw: float):
     """Corre el LP y devuelve las tablas por periodo, por dia, por tramo y el resumen."""
-    curvas = cargar(ROOT / "data" / "processed" / "curvas", todos)
+    t0 = time.perf_counter()
+    curvas = preparar_dias(ROOT / "data" / "processed" / "curvas", todos)
+    base = curvas.precios()
+    print(f"Curvas preparadas: {len(curvas.periodos)} periodos, {time.perf_counter() - t0:.0f} s")
     t0 = time.perf_counter()
     r = despacho_lp(curvas, mw, bat, float(sim["paso_mw"]), ciclos,
                     float(sim["carga_bordes"]), float(sim["penalizacion_eur_mwh"]))
-    base = precios(curvas)["precio_eur_mwh"].to_numpy(float)
     print(f"Simulacion: {len(todos)} dias, {len(r)} periodos, {len(r.attrs['tramos'])} tramos, "
           f"{time.perf_counter() - t0:.0f} s")
 
@@ -489,11 +667,13 @@ def main() -> None:
     cfg = yaml.safe_load((ROOT / "config" / "base.yaml").read_text(encoding="utf-8"))
     sim = cfg["simulacion_lp"]
     p = argparse.ArgumentParser()
+    p.add_argument("--desde", type=date.fromisoformat, default=date.fromisoformat(str(sim["desde"])))
+    p.add_argument("--hasta", type=date.fromisoformat, default=date.fromisoformat(str(sim["hasta"])))
     p.add_argument("--desde-csv", action="store_true",
                    help="no simular: rehacer Excel y figuras con los CSV de reports/simulacion_lp")
     args = p.parse_args()
     bat = Battery(**cfg["bateria"])
-    desde, hasta = date.fromisoformat(str(sim["desde"])), date.fromisoformat(str(sim["hasta"]))
+    desde, hasta = args.desde, args.hasta
     todos = [desde + timedelta(days=i) for i in range((hasta - desde).days + 1)]
     k = int(sim["dias_descartados"])
     analizados, descartados = todos[k:len(todos) - k], todos[:k] + todos[len(todos) - k:]

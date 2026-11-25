@@ -3,7 +3,7 @@ from datetime import date
 import numpy as np
 import pytest
 
-from pce68.data.curvas import parsear_curvas, precios
+from pce68.data.curvas import parsear_curvas, precios, preparar
 from pce68.dispatch.battery import Battery
 from pce68.dispatch.lp import despacho_lp, plan_lp
 
@@ -74,7 +74,7 @@ DEMANDA = [3500.0] * 10 + [1500.0] * 6 + [3500.0] * 3 + [6500.0] * 3 + [3500.0] 
 def test_despacho_lp_carga_en_el_valle_descarga_en_el_pico():
     c = parsear_curvas(curva_pbc(date(2025, 5, 15), DEMANDA))
     base = precios(c)["precio_eur_mwh"].to_numpy()
-    r = despacho_lp(c, 1000, BAT, paso_mw=250, ciclos=1)
+    r = despacho_lp(preparar(c), 1000, BAT, paso_mw=250, ciclos=1)
     d = r["delta_mw"].to_numpy()
     assert (d[10:16] >= 0).all() and d[10:16].sum() > 0  # carga a mediodia
     assert d[19:22].sum() < 0  # descarga en el pico
@@ -85,10 +85,24 @@ def test_despacho_lp_carga_en_el_valle_descarga_en_el_pico():
     tramos = r.attrs["tramos"]
     assert len(tramos) == 4 and tramos["activo"].all()
     assert r.attrs["planes"].shape == (4, 24)
+    # el recalculo parcial de precios da lo mismo que recalcular todo con el delta final
+    np.testing.assert_array_equal(p, precios(c, r.set_index("timestamp_utc")["delta_mw"])["precio_eur_mwh"])
 
 
 def test_despacho_lp_sin_parque_deja_el_precio_base():
     c = parsear_curvas(curva_pbc(date(2025, 5, 15), DEMANDA))
-    r = despacho_lp(c, 0, BAT, paso_mw=250, ciclos=1)
+    r = despacho_lp(preparar(c), 0, BAT, paso_mw=250, ciclos=1)
     assert not r["delta_mw"].any()
     np.testing.assert_array_equal(r["precio_eur_mwh"].to_numpy(), precios(c)["precio_eur_mwh"].to_numpy())
+
+
+def test_fotos_de_un_parque_grande_son_los_parques_pequenos():
+    prep = preparar(parsear_curvas(curva_pbc(date(2025, 5, 15), DEMANDA)))
+    grande = despacho_lp(prep, 1000, BAT, paso_mw=250, ciclos=1, fotos_mw=[500, 1000])
+    pequeno = despacho_lp(prep, 500, BAT, paso_mw=250, ciclos=1)
+    foto = grande.attrs["fotos"][500.0]
+    for col in ("delta_mw", "carga_mwh", "precio_eur_mwh"):
+        np.testing.assert_allclose(foto[col].to_numpy(), pequeno[col].to_numpy())
+        np.testing.assert_allclose(grande.attrs["fotos"][1000.0][col].to_numpy(), grande[col].to_numpy())
+    with pytest.raises(ValueError):
+        despacho_lp(prep, 1000, BAT, paso_mw=250, ciclos=1, fotos_mw=[600])

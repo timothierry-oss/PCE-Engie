@@ -1,0 +1,57 @@
+feature,coef_x,coef_x2
+hour_00,2.66776,-1.10602
+hour_01,2.29506,-0.14609
+hour_02,0.96761,1.11710
+hour_03,0.89447,1.40655
+hour_04,0.66910,1.48117
+hour_05,-1.39923,2.03036
+hour_06,-1.03336,0.47262
+hour_07,-6.30467,2.70402
+hour_08,-7.95265,3.37477
+hour_09,-9.30162,1.84104
+hour_10,-12.13336,3.20394
+hour_11,-5.49226,2.16493
+hour_12,3.15042,-1.57653
+hour_13,6.85380,-3.45194
+hour_14,4.95699,-2.33990
+hour_15,2.51466,-1.04393
+hour_16,-5.71911,2.62648
+hour_17,-14.25492,5.01266
+hour_18,-15.65359,4.57291
+hour_19,-19.10219,7.65476
+hour_20,-18.23016,7.92240
+hour_21,-16.80402,6.97295
+hour_22,-3.05412,0.24430
+hour_23,5.65438,-3.29422
+p0_spline_0,42.02699,49.87285
+p0_spline_1,-2.08238,10.77277
+p0_spline_2,51.09813,-10.25447
+p0_spline_3,15.93948,-3.31544
+p0_spline_4,-2.90018,-0.36156
+p0_spline_5,-17.71021,-6.65791
+p0_spline_6,-145.49873,26.89346
+p0_spline_7,-46.68410,-25.10538
+fin_de_semana (standardised),-0.47403,0.14561
+estacion_sin (standardised),3.51419,-1.44512
+estacion_cos (standardised),1.09432,0.28119
+p0_hora_antes (standardised),2.17840,0.32178
+p0_hora_despues (standardised),8.00593,-1.53854
+p0_dia_media (standardised),24.40868,-3.63764
+p0_dia_min (standardised),-5.72634,1.20521
+p0_dia_max (standardised),-6.30077,1.86560
+p0_dia_rango (standardised),-3.81211,1.42335
+demanda (standardised),6.09628,2.43102
+eolica (standardised),-0.02124,-3.35299
+solar_fv (standardised),0.68326,-6.79561
+solar_termica (standardised),0.44803,-0.64163
+hidraulica (standardised),-4.21193,4.43693
+nuclear (standardised),-1.78837,1.18084
+ciclo_combinado (standardised),-4.87630,4.27788
+cogeneracion (standardised),-0.41049,0.51408
+intercambios (standardised),-3.18605,2.68321
+bombeo_consumo (standardised),6.74500,-2.79510
+bombeo_turbinacion (standardised),-4.11850,2.04983
+demanda_residual (standardised),-10.60831,-6.31366
+cuota_renovable (standardised),-15.27456,5.33911
+gas (standardised),-0.80195,0.67454
+co2 (standardised),3.36540,-1.42567

@@ -34,11 +34,8 @@ def cargar_curvas(dia: date) -> pd.DataFrame:
     raise SystemExit(f"No hay curvas de {dia}: descargalas con scripts/02_descarga_curvas.py")
 
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--dia", type=date.fromisoformat, default=date(2025, 5, 15))
-    dia = p.parse_args().dia
-
+def compara(dia: date) -> pd.DataFrame:
+    """Precio publicado y cruce de las curvas en cada periodo de `dia`, con los tres modos."""
     ruta_omie = ROOT / "data" / "raw" / "omie" / omie.nombre_fichero(dia)
     if not ruta_omie.exists():
         raise SystemExit(f"No esta {ruta_omie}: ejecuta antes scripts/01_descarga_omie.py")
@@ -54,7 +51,48 @@ def main() -> None:
         t[col.replace("cruce", "dif")] = t[col] - t["precio_es"]
     t["iberico"] = t["precio_es"] == t["precio_pt"]
     t.insert(0, "hora", t["timestamp_utc"].dt.tz_convert(omie.TZ).dt.strftime("%H:%M"))
+    return t
 
+
+def resumen(dia: date, t: pd.DataFrame) -> dict:
+    """Una fila por dia: resolucion, periodos y, por modo, |dif| maxima, mediana y periodos a < 0,01."""
+    fila = {"dia": dia, "resolucion_min": int(t["resolucion_min"].iloc[0]) if "resolucion_min" in t
+            else 24 * 60 // len(t), "periodos": len(t), "con_separacion": int((~t["iberico"]).sum())}
+    for nombre, modo in (("dif", "casadas"), ("dif_ofertadas", "ofertadas"), ("dif_sin_complejas", "no")):
+        d = t[nombre].abs()
+        fila[f"max_{modo}"] = d.max()
+        fila[f"mediana_{modo}"] = d.median()
+        fila[f"exactos_{modo}"] = int((d < 0.01).sum())
+        fila[f"p95_{modo}"] = d.quantile(0.95)
+    return fila
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--dia", type=date.fromisoformat, nargs="+", default=[date(2025, 5, 15)],
+                   help="uno o varios dias; con varios solo se imprime el resumen por dia")
+    p.add_argument("--csv", type=Path, help="guarda el resumen por dia en este CSV")
+    args = p.parse_args()
+
+    if len(args.dia) > 1 or args.csv:
+        filas = []
+        for dia in args.dia:
+            try:
+                filas.append(resumen(dia, compara(dia)))
+            except SystemExit as e:
+                print(f"{dia}: {e}")
+        r = pd.DataFrame(filas)
+        pd.set_option("display.width", 250)
+        cols = ["dia", "periodos", "con_separacion"] + [f"{m}_{modo}" for modo in ("casadas", "no")
+                                                       for m in ("max", "p95", "mediana", "exactos")]
+        print(r[cols].round(2).to_string(index=False))
+        if args.csv:
+            r.to_csv(args.csv, index=False, float_format="%.3f")
+            print(f"\nGuardado en {args.csv}")
+        return
+
+    dia = args.dia[0]
+    t = compara(dia)
     pd.set_option("display.width", 200)
     print(t.drop(columns="timestamp_utc").round(2).to_string(index=False))
 

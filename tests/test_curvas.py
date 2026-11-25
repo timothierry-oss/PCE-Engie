@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pce68.data.curvas import cargar, parsear_curvas, precio_equilibrio, precios
+from pce68.data.curvas import cargar, parsear_curvas, precio_equilibrio, precios, preparar, preparar_dias
 
 TZ = "Europe/Madrid"
 
@@ -174,9 +174,65 @@ def test_precios_base_y_efecto_de_la_bateria():
     assert precios(c, descarga)["precio_eur_mwh"].eq(10.0).all()
 
 
+def test_curvas_preparadas_recalculo_parcial_y_por_dias(tmp_path):
+    dias = [date(2026, 9, 13), date(2026, 9, 14)]
+    for d in dias:
+        parsear_curvas(curva_pbc(d, 96, etiqueta=etiqueta_hq)).to_parquet(
+            tmp_path / f"curvas_{d:%Y%m%d}.parquet", index=False)
+    prep = preparar_dias(tmp_path, dias)
+    assert len(prep.periodos) == 192
+    junto = preparar(cargar(tmp_path, dias))
+    np.testing.assert_array_equal(prep.precios(), junto.precios())
+    delta = np.zeros(192)
+    delta[[5, 100]] = [120.0, -1950.0]
+    p = prep.precios()
+    p[[5, 100]] = prep.precios(delta, [5, 100])  # solo los periodos que cambian
+    np.testing.assert_array_equal(p, prep.precios(delta))
+    assert p[5] == 90.0 and p[100] == 10.0
+    with pytest.raises(FileNotFoundError):
+        preparar_dias(tmp_path, [date(2020, 1, 1)])
+
+
 def test_precios_solo_cambia_en_los_periodos_con_delta():
     c = parsear_curvas(curva_pbc(date(2025, 5, 15), 24))
     ts = c["timestamp_utc"].drop_duplicates()
     r = precios(c, pd.Series({ts.iloc[3]: 120.0}))
     assert r["precio_eur_mwh"].tolist() == [50.0] * 3 + [90.0] + [50.0] * 20
     assert np.all(r["timestamp_utc"].to_numpy() == ts.to_numpy())
+
+
+# ── Ficheros antiguos (hasta marzo de 2025): cabecera "Hora", sin tipologia
+
+# 800 MW a 20 €/MWh ofertados y no casados (una compleja rechazada): con todo lo ofertado el
+# cruce caeria a 20; el precio casado es 50 (200 de los 300 MW ofertados a 50).
+FILAS_ANTIGUAS = [
+    ("V", 1000.0, 10.0, "O"), ("V", 800.0, 20.0, "O"), ("V", 300.0, 50.0, "O"), ("V", 400.0, 80.0, "O"),
+    ("V", 1000.0, 10.0, "C"), ("V", 200.0, 50.0, "C"),
+    ("C", 1200.0, 100.0, "O"), ("C", 1200.0, 100.0, "C"),
+]
+
+
+def curva_pbc_antigua(dia: date, n: int) -> str:
+    cab = (
+        f"OMIE - Mercado de electricidad;Fecha Emisi\xf3n :15/03/2025 - 13:00;;{dia:%d/%m/%Y};"
+        "Mercado diario;;;;\n\n"
+        "Hora;Fecha;Pais;Unidad;Tipo Oferta;Energ\xeda Compra/Venta;Precio Compra/Venta;"
+        "Ofertada (O)/Casada (C);\n"
+    )
+    lineas = [f"{k};{dia:%d/%m/%Y};MI;;{tipo};{num(mw, 1)};{num(precio, 2)};{oc};"
+              for k in range(1, n + 1) for tipo, mw, precio, oc in FILAS_ANTIGUAS]
+    return cab + "\n".join(lineas) + "\n"
+
+
+def test_formato_antiguo_ignora_ofertas_no_casadas_bajo_el_precio():
+    c = parsear_curvas(curva_pbc_antigua(date(2025, 3, 16), 24))
+    assert len(c["timestamp_utc"].unique()) == 24
+    assert (c["tipologia"] == "").all()
+    for modo in ("casadas", "ofertadas", "no"):
+        assert np.allclose(precios(c, complejas=modo)["precio_eur_mwh"], 50.0)
+    ts = c["timestamp_utc"].drop_duplicates()
+    # +100 MW de demanda: quedan 100 MW a 50; +300 MW: hace falta la oferta a 80
+    assert np.allclose(precios(c, pd.Series(100.0, index=ts))["precio_eur_mwh"], 50.0)
+    assert np.allclose(precios(c, pd.Series(300.0, index=ts))["precio_eur_mwh"], 80.0)
+    # descarga de 300 MW: la oferta a 10 cubre 1300 >= 1200
+    assert np.allclose(precios(c, pd.Series(-300.0, index=ts))["precio_eur_mwh"], 10.0)
